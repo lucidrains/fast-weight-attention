@@ -2,13 +2,14 @@ from __future__ import annotations
 from functools import partial
 
 import torch
-from torch import nn, randn
+from torch import nn, cat, randn
 from torch.nn import Module, Linear, ParameterDict, Sequential
 
 from einx import multiply
 from einops import einsum, repeat, rearrange, reduce, pack, unpack
 from einops.layers.torch import Rearrange
 
+from torch_einops_utils import pack_with_inverse
 from adam_atan2_pytorch.muon_adam_atan2 import newtonschulz5
 from adam_atan2_pytorch.polar_adam_atan2 import polar_express
 
@@ -30,6 +31,25 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def is_empty_tensor(t):
+    return t.numel() == 0
+
+def softclamp_max(t, max_value):
+    half_max_value = max_value / 2
+    return ((t / half_max_value).tanh() * half_max_value) + half_max_value
+
+def softclamp_grad_norm(t, max_value, eps = 1e-10):
+    if is_empty_tensor(t):
+        return t
+
+    t, inverse = pack_with_inverse(t, 'b h *')
+
+    norm = t.norm(dim = -1, keepdim = True)
+    clamped_norm = softclamp_max(norm, max_value)
+
+    t = t * (clamped_norm / norm.clamp(min = eps))
+    return inverse(t)
+
 # classes
 
 class FastWeightAttention(Module):
@@ -43,7 +63,9 @@ class FastWeightAttention(Module):
         max_learning_rate = 1e-2,
         max_muon_learning_rate = 1e-1,
         muon_update = True,
-        use_polar_express = False
+        use_polar_express = False,
+        max_grad_norm = 10.,
+        eps = 1e-10
     ):
         super().__init__()
 
@@ -59,11 +81,14 @@ class FastWeightAttention(Module):
 
         # memory parameters
 
+        dim_in_scale = dim ** -0.5
+        dim_out_scale = (heads * dim_value_head) ** -0.5
+
         self.attn_memory = ParameterDict(dict(
-            wq = randn(heads, dim, dim_head),
-            wk = randn(heads, dim, dim_head),
-            wv = randn(heads, dim, dim_value_head),
-            wo = randn(heads, dim_value_head, dim),
+            wq = randn(heads, dim, dim_head) * dim_in_scale,
+            wk = randn(heads, dim, dim_head) * dim_in_scale,
+            wv = randn(heads, dim, dim_value_head) * dim_in_scale,
+            wo = randn(heads, dim_value_head, dim) * dim_out_scale,
         ))
 
         self.memory_keys = self.attn_memory.keys()
@@ -83,6 +108,8 @@ class FastWeightAttention(Module):
         self.use_polar_express = use_polar_express
 
         self.max_muon_learning_rate = max_muon_learning_rate
+        self.max_grad_norm = max_grad_norm
+        self.eps = eps
 
         # target values
         # using the z-score as well as the gating as done for fast-weight PKM proposed by Sakana AI
@@ -106,7 +133,9 @@ class FastWeightAttention(Module):
         tokens,
         return_next_memories = False,
         past_mem: AttentionMemory | None = None,
-        detach_next_memories = False
+        detach_next_memories = False,
+        cached_kv: tuple | None = None,
+        return_cached_kv = False
     ):
         batch, scale, muon_update = tokens.shape[0], self.scale, self.muon_update
 
@@ -132,6 +161,15 @@ class FastWeightAttention(Module):
         k = einsum(tokens, wk, 'b n d, b h d dh -> b h n dh')
         v = einsum(tokens, wv, 'b n d, b h d dh -> b h n dh')
 
+        # kv caching
+
+        if exists(cached_kv):
+            ck, cv = cached_kv
+            k = torch.cat((ck, k), dim = -2)
+            v = torch.cat((cv, v), dim = -2)
+
+        next_cached_kv = (k, v)
+
         score = einsum(q, k, 'b h i dh, b h j dh -> b h i j') * scale
 
         if self.causal:
@@ -148,7 +186,13 @@ class FastWeightAttention(Module):
         pred_values = einsum(out, wo, 'b h n dh, b h dh d -> b n d')
 
         if not return_next_memories:
+            if return_cached_kv:
+                return pred_values, next_cached_kv
+
             return pred_values
+
+        seq_len = tokens.shape[-2]
+        assert seq_len > 1, 'chunk size (seq_len) must be greater than 1'
 
         target_values = self.to_target_values(tokens[..., 1:, :])
 
@@ -165,15 +209,6 @@ class FastWeightAttention(Module):
         attn = attn[..., :-1, :-1]
 
         q, k, v = q[..., :-1, :], k[..., :-1, :], v[..., :-1, :]
-
-        # per token learning rate related
-
-        learning_rate = self.to_learning_rate(tokens) * self.max_learning_rate
-
-        if muon_update:
-            learning_rate, muon_learning_rate = learning_rate.unbind(dim = -1)
-        else:
-            learning_rate = rearrange(learning_rate, '... 1 -> ...')
 
         # mse error
         # flipped sign so no need to -grad at end
@@ -197,16 +232,18 @@ class FastWeightAttention(Module):
         dq = einsum(k, dscore, 'b h j dh, b h i j -> b h i dh')
         dk = einsum(q, dscore, 'b h i dh, b h i j -> b h j dh')
 
-        # apply learning rates
+        # apply per token learning rates
+
+        learning_rate = self.to_learning_rate(tokens) * self.max_learning_rate
 
         if muon_update:
-            tokens_for_dwqk = multiply('b n d, b n', tokens, learning_rate)
-            tokens_for_dwv = multiply('b n d, b n', tokens, muon_learning_rate)
-            out_for_dwo = multiply('b h n d, b n', out, muon_learning_rate)
+            learning_rate, muon_learning_rate = learning_rate.unbind(dim = -1)
         else:
-            tokens_for_dwqk = tokens
-            tokens_for_dwv = tokens
-            out_for_dwo = out
+            learning_rate = rearrange(learning_rate, '... 1 -> ...')
+
+        tokens_for_dwqk = multiply('b n d, b n', tokens, learning_rate)
+        tokens_for_dwv = multiply('b n d, b n', tokens, muon_learning_rate if muon_update else learning_rate)
+        out_for_dwo = multiply('b h n d, b n', out, muon_learning_rate if muon_update else learning_rate)
 
         # get the next memories
 
@@ -219,6 +256,11 @@ class FastWeightAttention(Module):
             update_fn = polar_express if self.use_polar_express else newtonschulz5
             dwv = update_fn(dwv)
             dwo = update_fn(dwo)
+
+        dwq = softclamp_grad_norm(dwq, self.max_grad_norm, eps = self.eps)
+        dwk = softclamp_grad_norm(dwk, self.max_grad_norm, eps = self.eps)
+        dwv = softclamp_grad_norm(dwv, self.max_grad_norm, eps = self.eps)
+        dwo = softclamp_grad_norm(dwo, self.max_grad_norm, eps = self.eps)
 
         # prep next memories
 
