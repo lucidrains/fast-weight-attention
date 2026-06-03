@@ -50,6 +50,30 @@ def soft_clip_max_norm(weights, max_norm, dim, eps = 1e-5):
 
 # classes
 
+class ReverseCausalAttention(Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.scale = dim ** -0.5
+        self.to_qkv = LinearNoBias(dim, dim * 3)
+
+    def forward(self, x):
+        n, device = x.shape[-2], x.device
+
+        q, k, v = self.to_qkv(x).chunk(3, dim = -1)
+
+        score = einsum(q, k, 'b n d, b m d -> b n m') * self.scale
+
+        # reverse causal - each token attends to itself and future tokens
+
+        mask = torch.ones((n, n), device = device, dtype = torch.bool).tril(-1)
+        score = score.masked_fill(mask, -torch.finfo(score.dtype).max)
+
+        attn = score.softmax(dim = -1)
+
+        return einsum(attn, v, 'b n m, b m d -> b n d')
+
+# main class
+
 class FastWeightAttention(Module):
     def __init__(
         self,
@@ -63,11 +87,13 @@ class FastWeightAttention(Module):
         muon_update = True,
         use_polar_express = False,
         use_gates = True,
-        max_fast_weight_norm = None
+        max_fast_weight_norm = None,
+        use_reverse_causal_target = False
     ):
         super().__init__()
 
         self.use_gates = use_gates
+        self.use_reverse_causal_target = use_reverse_causal_target
 
         dim_value_head = default(dim_value_head, dim_head)
 
@@ -117,12 +143,15 @@ class FastWeightAttention(Module):
         self.register_buffer('lr_scales', lr_scales, persistent = False)
 
         # target values
+
+        if self.use_reverse_causal_target:
+            self.to_target_values = ReverseCausalAttention(dim)
+        else:
+            self.to_target_values = LinearNoBias(dim, dim)
+
         # using the z-score as well as done for fast-weight PKM proposed by Sakana AI
 
-        self.to_target_values = Sequential(
-            LinearNoBias(dim, dim),
-            nn.LayerNorm(dim, elementwise_affine = False)
-        )
+        self.target_values_norm = nn.LayerNorm(dim, elementwise_affine = False)
 
         # whether to clip the fast weight norms
         # Volchkov et al. from Clip to Grok
@@ -197,7 +226,9 @@ class FastWeightAttention(Module):
         if not return_next_memories:
             return pred_values
 
-        target_values = self.to_target_values(tokens[..., 1:, :])
+        target_values_full = self.to_target_values(tokens)
+        target_values_full = self.target_values_norm(target_values_full)
+        target_values = target_values_full[..., 1:, :]
 
         # extract boundary state for the next chunk before slicing
 
@@ -228,7 +259,7 @@ class FastWeightAttention(Module):
         if exists(boundary_state):
             b_tokens, b_pred_values, b_out, b_gates, b_out_pre_gate, b_q, b_k, b_v = boundary_state
 
-            boundary_target = self.to_target_values(tokens[..., :1, :])
+            boundary_target = target_values_full[..., :1, :]
             target_values = cat((boundary_target, target_values), dim = -2)
 
             # cleanly concat boundary state to the rest of the tensors
