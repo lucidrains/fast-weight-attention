@@ -130,7 +130,7 @@ class ChunkManager(Module):
             out_list.append(out)
 
         if len(out_list) == 0:
-            return None, past_mem
+            return (None, past_mem) if return_next_memories else None
 
         res = cat(out_list, dim = -2)
 

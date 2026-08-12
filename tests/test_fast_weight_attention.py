@@ -89,3 +89,20 @@ def test_chunk_manager(causal, use_gates):
 
     for k in mem_all.memory:
         assert torch.allclose(mem_all.memory[k], past_mem.memory[k], atol = 1e-4)
+
+def test_chunk_manager_partial_chunk_return_type():
+    net = FastWeightAttention(dim = 16, dim_head = 8, heads = 2)
+    manager = ChunkManager(net, chunk_size = 8)
+
+    partial = torch.randn(1, 3, 16)
+
+    # a partial chunk is buffered, so nothing is emitted
+
+    res, past_mem = manager(partial, return_next_memories = True)
+    assert res is None
+    assert exists(past_mem.buffer)
+
+    # without return_next_memories, a plain None is returned (not a tuple)
+
+    res = manager(partial, return_next_memories = False)
+    assert res is None

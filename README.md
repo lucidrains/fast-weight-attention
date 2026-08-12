@@ -50,6 +50,11 @@ retrieved, next_mem = mem(tokens, return_next_memories = True)
 assert retrieved.shape == tokens.shape
 ```
 
+> Note: a trailing segment shorter than `chunk_size` is buffered (not processed) so that
+> chunk boundaries stay consistent across streaming calls — feed it the remaining tokens
+> (or the next tokens) in a subsequent call to have it emitted. If you need the full
+> output from a single call, make the sequence length a multiple of `chunk_size`.
+
 ## Citations
 
 ```bibtex
