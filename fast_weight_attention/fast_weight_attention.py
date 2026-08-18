@@ -158,10 +158,11 @@ class FastWeightAttention(Module):
 
         self.max_fast_weight_norm = max_fast_weight_norm
         self.should_clip_weight_norm = exists(max_fast_weight_norm)
-        self.weight_name_to_row_dim = dict(wq = 1, wk = 1, wv = 1, wo = -1)
+
+        self.weight_name_to_row_dim = dict(wq = -2, wk = -2, wv = -2, wo = -1)
 
         if self.use_gates:
-            self.weight_name_to_row_dim.update(wg = 1)
+            self.weight_name_to_row_dim.update(wg = -2)
 
     def init_memories(self, batch):
         return {name: repeat(weights, '... -> b ...', b = batch) for name, weights in self.attn_memory.items()}
