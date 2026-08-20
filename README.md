@@ -31,29 +31,11 @@ assert retrieved.shape == tokens.shape
 retrieved = mem(tokens, return_next_memories = False)
 ```
 
-With chunked processing (automatically segments the sequence and carries memory across chunks):
-
-```python
-import torch
-from fast_weight_attention import ChunkedFastWeightAttention
-
-mem = ChunkedFastWeightAttention(
-    512,
-    causal = True,
-    chunk_size = 64   # process 64 tokens at a time, carrying fast weight memories across chunks
-)
-
-tokens = torch.randn(1, 512, 512)
-
-retrieved, next_mem = mem(tokens, return_next_memories = True)
-
-assert retrieved.shape == tokens.shape
-```
-
-> Note: a trailing segment shorter than `chunk_size` is buffered (not processed) so that
-> chunk boundaries stay consistent across streaming calls — feed it the remaining tokens
-> (or the next tokens) in a subsequent call to have it emitted. If you need the full
-> output from a single call, make the sequence length a multiple of `chunk_size`.
+> Sequences are segmented internally at `chunk_size` boundaries (defaults to the full sequence), carrying
+> the fast weight memories across chunks. The last token of each completed chunk is marked with a learned
+> boundary embedding, and its store target wraps around to the chunk's first token - no lookahead needed.
+> Chunks shorter than `chunk_size` are processed immediately, with the last token of an incomplete chunk
+> excluded from the fast weight update.
 
 ## Citations
 

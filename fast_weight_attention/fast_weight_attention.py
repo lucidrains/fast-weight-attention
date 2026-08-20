@@ -1,14 +1,14 @@
 from __future__ import annotations
 from functools import partial
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
-from torch import cat, nn, randn, tensor
+from torch import cat, nn, randn, roll, tensor
 from torch.nn import Module, Linear, ParameterDict, Sequential
 
 from einx import multiply
-from einops import einsum, repeat, rearrange, reduce, pack, unpack
-from einops.layers.torch import Rearrange
+from einops import einsum, repeat, rearrange, reduce
 
 from adam_atan2_pytorch.muon_adam_atan2 import newtonschulz5
 from adam_atan2_pytorch.polar_adam_atan2 import polar_express
@@ -23,6 +23,12 @@ def AttentionMemory(*, wq, wk, wv, wo, wg = None):
 def add_memories(mem1, mem2):
     return {k: mem1[k] + mem2[k] for k in mem1.keys()}
 
+# state
+
+class FastWeightState(NamedTuple):
+    memory: dict
+    token_count: int = 0
+
 # helpers
 
 def exists(v):
@@ -33,6 +39,12 @@ def default(v, d):
 
 def remove_none_values(d):
     return {k: v for k, v in d.items() if exists(v)}
+
+def divisible_by(num, den):
+    return (num % den) == 0
+
+def is_greater_than_zero(n):
+    return n > 0
 
 # differentiable clip weight norm
 
@@ -82,20 +94,32 @@ class FastWeightAttention(Module):
         dim_value_head = None,
         heads = 8,
         causal = True,
+        chunk_size = None,
+        use_forget_gate = False,
         max_learning_rate = 1e-2,
         max_muon_learning_rate = 1e-1,
         muon_update = True,
         use_polar_express = False,
         use_gates = True,
         max_fast_weight_norm = None,
-        use_reverse_causal_target = False
+        use_reverse_causal_target = False,
+        use_boundary_embed = True
     ):
         super().__init__()
 
         self.use_gates = use_gates
-        self.use_reverse_causal_target = use_reverse_causal_target
+        self.chunk_size = chunk_size
+
+        assert not exists(chunk_size) or chunk_size >= 2, 'chunk size must be at least 2'
 
         dim_value_head = default(dim_value_head, dim_head)
+
+        # boundary embedding - added to the hidden state of the last token of each completed chunk, and its query
+        # replaced by the embedding itself, so all chunk boundaries route to the same memory region. the store
+        # target for the boundary token is the chunk's first token, so the boundary slot comes to hold the previous
+        # chunk's first token - resolving the boundary prediction without any lookahead
+
+        self.boundary_embed = nn.Parameter(torch.zeros(dim)) if use_boundary_embed else None
 
         self.norm = nn.RMSNorm(dim)
 
@@ -122,7 +146,14 @@ class FastWeightAttention(Module):
             for name, shape in shapes.items()
         })
 
-        self.memory_keys = self.attn_memory.keys()
+        # forget gate - chunk level, applied to the fast weight memories of the previous chunk
+        # gdn update rule - mean of the stored input embeddings, then projected (not projected then averaged)
+
+        self.use_forget_gate = use_forget_gate
+
+        if use_forget_gate:
+            self.to_forget_gates = nn.Linear(dim, heads, bias = True)
+            self.forget_gate_decay = nn.Parameter(tensor(0.))
 
         # to optimizer related
 
@@ -134,17 +165,16 @@ class FastWeightAttention(Module):
         # muon related
 
         self.muon_update = muon_update
-        self.use_polar_express = use_polar_express
 
         if muon_update:
-            self.muon_update_fn = partial(polar_express if self.use_polar_express else newtonschulz5, bypass_update_fn = lambda ndim: False)
+            self.muon_update_fn = partial(polar_express if use_polar_express else newtonschulz5, bypass_update_fn = lambda ndim: False)
 
         lr_scales = tensor([max_learning_rate, max_muon_learning_rate]) if muon_update else tensor([max_learning_rate])
         self.register_buffer('lr_scales', lr_scales, persistent = False)
 
         # target values
 
-        if self.use_reverse_causal_target:
+        if use_reverse_causal_target:
             self.to_target_values = ReverseCausalAttention(dim)
         else:
             self.to_target_values = LinearNoBias(dim, dim)
@@ -172,27 +202,99 @@ class FastWeightAttention(Module):
         tokens,
         return_next_memories = False,
         return_grads_only = False,
-        past_mem: AttentionMemory | None = None,
-        detach_next_memories = False,
-        boundary_state: tuple | None = None,
-        return_boundary_state = False
+        past_mem: FastWeightState | None = None,
+        detach_next_memories_every: int | None = None,
+        ablate_mem: bool = False
     ):
-        batch, scale, muon_update, use_gates, should_clip_weight_norm = tokens.shape[0], self.scale, self.muon_update, self.use_gates, self.should_clip_weight_norm
+        batch = tokens.shape[0]
+        seq_len = tokens.shape[-2]
+        chunk_size = max(default(self.chunk_size, seq_len), 2)
+
+        past_mem = default(past_mem, FastWeightState(self.init_memories(batch)))
+
+        if seq_len == 0:
+            return (tokens, past_mem) if return_next_memories else tokens
 
         # prenorm
 
         tokens = self.norm(tokens)
 
+        # calc segments reaching chunk boundaries
+
+        count, memory = past_mem.token_count, past_mem.memory
+
+        to_bound = chunk_size - (count % chunk_size)
+        remainder = max(0, seq_len - to_bound)
+        num_chunks, chunk_remainder = divmod(remainder, chunk_size)
+
+        split_sizes = (min(seq_len, to_bound), *([chunk_size] * num_chunks), chunk_remainder)
+        segments = tokens.split(tuple(filter(is_greater_than_zero, split_sizes)), dim = -2)
+
+        out_list = []
+
+        for chunk_index, segment in enumerate(segments):
+            # periodic truncated bptt - detach memories every N chunks
+
+            should_detach = exists(detach_next_memories_every) and divisible_by(chunk_index + 1, detach_next_memories_every)
+
+            segment_len = segment.shape[-2]
+            ends_boundary = divisible_by(count + segment_len, chunk_size)
+
+            past_memory = None
+            if exists(memory) and not ablate_mem:
+                if self.use_forget_gate:
+                    chunk_embedding = reduce(segment, 'b n d -> b d', 'mean')
+                    forget_logits = self.to_forget_gates(chunk_embedding)
+                    forget_gates = (-self.forget_gate_decay * F.softplus(forget_logits)).exp()
+                    past_memory = {k: multiply('b h, b h ... -> b h ...', forget_gates, v) for k, v in memory.items()}
+                else:
+                    past_memory = memory
+
+            out, next_memory = self._forward_chunk(
+                segment,
+                past_mem = past_memory,
+                mark_boundary = ends_boundary,
+                return_next_memories = return_next_memories,
+                return_grads_only = return_grads_only,
+                detach_next_memories = should_detach
+            )
+
+            memory = next_memory
+            count += segment_len
+
+            out_list.append(out)
+
+        res = cat(out_list, dim = -2)
+
+        if not return_next_memories:
+            return res
+
+        return res, FastWeightState(memory = memory, token_count = count)
+
+    def _forward_chunk(
+        self,
+        tokens,
+        past_mem: dict | None = None,
+        mark_boundary = False,
+        return_next_memories = False,
+        return_grads_only = False,
+        detach_next_memories = False
+    ):
+        batch, scale, muon_update, use_gates, should_clip_weight_norm = tokens.shape[0], self.scale, self.muon_update, self.use_gates, self.should_clip_weight_norm
+
+        # mark the last token of each completed chunk with the boundary embedding - added to its hidden state so
+        # the model knows it is special, and its query replaced by the embedding itself
+
+        if mark_boundary and exists(self.boundary_embed):
+            tokens = cat((tokens[..., :-1, :], tokens[..., -1:, :] + self.boundary_embed), dim = -2)
+
         # add the fast weight memories
 
-        if exists(past_mem):
-            memory = past_mem
-        else:
-            memory = self.init_memories(batch)
+        memory = default(past_mem, self.init_memories(batch))
 
         # get the memories
 
-        wq, wk, wv, wo = tuple(memory[name] for name in ('wq', 'wk', 'wv', 'wo'))
+        wq, wk, wv, wo = (memory[name] for name in ('wq', 'wk', 'wv', 'wo'))
 
         gates = None
 
@@ -206,6 +308,15 @@ class FastWeightAttention(Module):
         q = einsum(tokens, wq, 'b n d, b h d dh -> b h n dh')
         k = einsum(tokens, wk, 'b n d, b h d dh -> b h n dh')
         v = einsum(tokens, wv, 'b n d, b h d dh -> b h n dh')
+
+        if mark_boundary and exists(self.boundary_embed):
+            # query for the boundary token is the boundary embedding itself, so all chunk boundaries
+            # route to the same memory region
+
+            boundary_embed = repeat(self.boundary_embed, 'd -> b 1 d', b = batch)
+            boundary_q = einsum(boundary_embed, wq, 'b n d, b h d dh -> b h n dh')
+
+            q = cat((q[..., :-1, :], boundary_q), dim = -2)
 
         score = einsum(q, k, 'b h i dh, b h j dh -> b h i j') * scale
 
@@ -225,63 +336,37 @@ class FastWeightAttention(Module):
         pred_values = einsum(out, wo, 'b h n dh, b h dh d -> b n d')
 
         if not return_next_memories:
-            return pred_values
+            return pred_values, memory
 
         target_values_full = self.to_target_values(tokens)
         target_values_full = self.target_values_norm(target_values_full)
-        target_values = target_values_full[..., 1:, :]
 
-        # extract boundary state for the next chunk before slicing
+        if mark_boundary:
+            # store target for each token is the value of the following token, wrapping around at the chunk end - so
+            # the boundary slot comes to hold the value of the chunk's first token, no lookahead needed
 
-        next_boundary_state = (
-            tokens[..., -1:, :],
-            pred_values[..., -1:, :],
-            out[..., -1:, :],
-            gates[..., -1:, :] if use_gates else None,
-            out_pre_gate[..., -1:, :] if use_gates else None,
-            q[..., -1:, :],
-            k[..., -1:, :],
-            v[..., -1:, :]
-        )
-
-        # base slicing for backwards pass
-
-        tokens = tokens[..., :-1, :]
-        pred_values_for_fast_weight = pred_values[..., :-1, :]
-        out = out[..., :-1, :]
-
-        if exists(gates):
-            gates = gates[..., :-1, :]
-            out_pre_gate = out_pre_gate[..., :-1, :]
-
-        attn_sliced = attn[..., :-1, :-1]
-        q, k, v = q[..., :-1, :], k[..., :-1, :], v[..., :-1, :]
-
-        if exists(boundary_state):
-            b_tokens, b_pred_values, b_out, b_gates, b_out_pre_gate, b_q, b_k, b_v = boundary_state
-
-            boundary_target = target_values_full[..., :1, :]
-            target_values = cat((boundary_target, target_values), dim = -2)
-
-            # cleanly concat boundary state to the rest of the tensors
-
-            tokens, pred_values_for_fast_weight, out, q, k, v = tuple(
-                cat((b_t, t), dim = -2) for b_t, t in zip(
-                    (b_tokens, b_pred_values, b_out, b_q, b_k, b_v),
-                    (tokens, pred_values_for_fast_weight, out, q, k, v)
-                )
-            )
-
-            if exists(gates) and exists(b_gates):
-                gates = cat((b_gates, gates), dim = -2)
-                out_pre_gate = cat((b_out_pre_gate, out_pre_gate), dim = -2)
-
-            # pad attention matrix dynamically for the boundary token
-
-            attn = F.pad(attn_sliced, (1, 0, 1, 0), value = 0.)
-            attn[..., 0, 0] = 1.
+            target_values = roll(target_values_full, -1, dims = -2)
+            pred_values_for_fast_weight = pred_values
         else:
-            attn = attn_sliced
+            target_values = target_values_full[..., 1:, :]
+
+            # base slicing for backwards pass - the last token of an incomplete chunk has no target yet
+
+            tokens = tokens[..., :-1, :]
+            pred_values_for_fast_weight = pred_values[..., :-1, :]
+            out = out[..., :-1, :]
+
+            if exists(gates):
+                gates = gates[..., :-1, :]
+                out_pre_gate = out_pre_gate[..., :-1, :]
+
+            attn = attn[..., :-1, :-1]
+            q, k, v = q[..., :-1, :], k[..., :-1, :], v[..., :-1, :]
+
+        if tokens.shape[-2] == 0:
+            # nothing to update - lone token of an incomplete chunk has no target yet
+
+            return pred_values, memory
 
         # per token learning rate related
 
@@ -371,7 +456,4 @@ class FastWeightAttention(Module):
         if detach_next_memories:
             next_mems = {k: v.detach() for k, v in next_mems.items()}
 
-        if not return_boundary_state:
-            return pred_values, next_mems
-
-        return pred_values, next_mems, next_boundary_state
+        return pred_values, next_mems

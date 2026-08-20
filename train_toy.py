@@ -21,7 +21,7 @@ from tqdm import tqdm
 from einops import rearrange
 from termcolor import colored
 
-from fast_weight_attention import FastWeightAttention, ChunkManager
+from fast_weight_attention import FastWeightAttention
 from x_mlps_pytorch import Feedforwards
 
 # helpers
@@ -34,6 +34,25 @@ def default(val, d):
 
 def print_header(char = '-', length = 40):
     print(char * length)
+
+def per_position_acc(model, num_tokens, batch_size, half_len, total_len):
+    model.eval()
+
+    with torch.no_grad():
+        correct = torch.zeros(total_len - 1, device = next(model.parameters()).device)
+        counts = torch.zeros(total_len - 1, device = next(model.parameters()).device)
+
+        for _ in range(200):
+            half = torch.randint(0, num_tokens, (batch_size, half_len))
+            seq = torch.cat((half, half), dim = -1)
+
+            preds, _ = model(seq, return_next_memories = True)
+            preds = preds[:, :-1]
+
+            correct += (preds.argmax(dim = -1) == seq[:, 1:]).float().sum(dim = 0)
+            counts += batch_size
+
+        return correct / counts
 
 # model
 
@@ -63,20 +82,18 @@ class MemorizingModel(nn.Module):
 
         self.layers = nn.ModuleList([
             nn.ModuleList([
-                ChunkManager(
-                    FastWeightAttention(
-                        dim = dim,
-                        dim_head = dim_head,
-                        dim_value_head = dim_value_head,
-                        heads = heads,
-                        causal = causal,
-                        muon_update = muon_update,
-                        use_polar_express = use_polar_express,
-                        max_learning_rate = max_learning_rate,
-                        use_gates = use_gates,
-                        max_fast_weight_norm = max_fast_weight_norm,
-                        use_reverse_causal_target = use_reverse_causal_target
-                    ),
+                FastWeightAttention(
+                    dim = dim,
+                    dim_head = dim_head,
+                    dim_value_head = dim_value_head,
+                    heads = heads,
+                    causal = causal,
+                    muon_update = muon_update,
+                    use_polar_express = use_polar_express,
+                    max_learning_rate = max_learning_rate,
+                    use_gates = use_gates,
+                    max_fast_weight_norm = max_fast_weight_norm,
+                    use_reverse_causal_target = use_reverse_causal_target,
                     chunk_size = chunk_size,
                     use_forget_gate = use_forget_gate
                 ),
@@ -174,6 +191,7 @@ def train(
     print('')
 
     results = dict()
+    per_pos_results = dict()
     conditions = (True,) if single_run else (True, False)
 
     for use_gates in conditions:
@@ -256,7 +274,14 @@ def train(
 
                 pbar.set_postfix(loss = f'{loss_val:.3f}', acc = f'{acc.item():.3f}')
 
+        # per-position accuracy on the second half, to verify the first token of the second half is handled
+
+        per_pos = per_position_acc(model, num_tokens, batch_size, half_len, total_len)
+
         results[label] = sum(last_accs) / len(last_accs)
+        per_pos_results[label] = per_pos[half_len].item()
+
+        pbar.write(colored(f'  Second half mean: {per_pos[half_len:].mean():.1%} | 1st token of 2nd half: {per_pos[half_len]:.1%}', 'dark_grey'))
 
     # report
 
@@ -264,6 +289,7 @@ def train(
     print_header()
     for label, acc in results.items():
         print(f'  {label}: {acc:.1%}')
+        print(f'     1st token of 2nd half: {per_pos_results[label]:.1%}')
     print_header()
 
     if not single_run and 'No_Gates' in results:
