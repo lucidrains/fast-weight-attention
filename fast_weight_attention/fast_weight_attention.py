@@ -107,6 +107,8 @@ class FastWeightAttention(Module):
     ):
         super().__init__()
 
+        self.dim = dim
+
         self.use_gates = use_gates
         self.chunk_size = chunk_size
 
